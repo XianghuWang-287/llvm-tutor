@@ -66,46 +66,57 @@ void visitor(Function &F) {
 
   std::map<Expression, unsigned> LVNTable;
   std::map<Value *, unsigned> ValueNumbers;
+  std::map<int, unsigned> ConstantNumbers;
   unsigned nextValueNumber = 1;
 
   for (auto &BB : F) {
     for (auto &I : BB) {
-      //handle store operation
       if (auto *Store = dyn_cast<StoreInst>(&I)) {
-        Value *StoredValue = Store->getValueOperand(); //value being stored
-        Value *Pointer = Store->getPointerOperand(); //Destination where it's stored
+        Value *StoredValue = Store->getValueOperand();
+        Value *Pointer = Store->getPointerOperand();
 
-        if (!ValueNumbers.count(StoredValue)) {
-          ValueNumbers[StoredValue] = nextValueNumber++; //If StoredValue is new, assign a fresh number
+        if (auto *ConstOp = dyn_cast<ConstantInt>(StoredValue)) {
+          int ConstValue = ConstOp->getSExtValue();
+          if (!ConstantNumbers.count(ConstValue)) {
+            ConstantNumbers[ConstValue] = nextValueNumber++;
+          }
+          ValueNumbers[Pointer] = ConstantNumbers[ConstValue];
+        } else {
+          if (!ValueNumbers.count(StoredValue)) {
+            ValueNumbers[StoredValue] = nextValueNumber++;
+          }
+          ValueNumbers[Pointer] = ValueNumbers[StoredValue];
         }
-        ValueNumbers[Pointer] = ValueNumbers[StoredValue]; //Maps Pointer to the stored value’s number
-        //errs() << I << "\t" << ValueNumbers[Pointer] << " = " << ValueNumbers[StoredValue] << "\n";
         errs() << formatv("{0,-40} {1} = {2}\n", I, ValueNumbers[Pointer], ValueNumbers[StoredValue]);
-      } else if (auto *Load = dyn_cast<LoadInst>(&I)) { //handle load operation
+      } else if (auto *Load = dyn_cast<LoadInst>(&I)) {
         Value *Pointer = Load->getPointerOperand();
 
         if (ValueNumbers.count(Pointer)) {
-          ValueNumbers[&I] = ValueNumbers[Pointer]; //If Pointer is known, assigns same number
+          ValueNumbers[&I] = ValueNumbers[Pointer];
         } else {
-          ValueNumbers[&I] = nextValueNumber++; //Otherwise, assigns a fresh number
+          ValueNumbers[&I] = nextValueNumber++;
         }
-        //errs() << I << "\t" << ValueNumbers[&I] << " = " << ValueNumbers[Pointer] << "\n";
         errs() << formatv("{0,-40} {1} = {2}\n", I, ValueNumbers[&I], ValueNumbers[Pointer]);
-      } else if (auto *BinOp = dyn_cast<BinaryOperator>(&I)) {  //handle arithmetic operation
-        unsigned LHS = ValueNumbers[BinOp->getOperand(0)]; //Get value numbers for operands
-        unsigned RHS = ValueNumbers[BinOp->getOperand(1)];
-        Expression Expr(BinOp->getOpcode(), LHS, RHS); //Creates a unique key to detect redundancy
+      } else if (auto *BinOp = dyn_cast<BinaryOperator>(&I)) {
+        unsigned LHS = ValueNumbers[BinOp->getOperand(0)];
+        unsigned RHS;
+        if (auto *ConstOp = dyn_cast<ConstantInt>(BinOp->getOperand(1))) {
+          int ConstValue = ConstOp->getSExtValue();
+          if (!ConstantNumbers.count(ConstValue)) {
+            ConstantNumbers[ConstValue] = nextValueNumber++;
+          }
+          RHS = ConstantNumbers[ConstValue];
+        } else {
+          RHS = ValueNumbers[BinOp->getOperand(1)];
+        }
+        Expression Expr(BinOp->getOpcode(), LHS, RHS);
 
-        if (LVNTable.count(Expr)) { //If expression exists, reuse its value number (redundant label)
+        if (LVNTable.count(Expr)) {
           ValueNumbers[&I] = LVNTable[Expr];
-          //errs() << I << "\t" << ValueNumbers[&I] << " = "
-                 //<< LHS << " " << getOpcodeName(BinOp->getOpcode()) << " " << RHS << " (redundant)\n";
           errs() << formatv("{0,-40} {1} = {2} {3} {4} (redundant)\n", I, ValueNumbers[&I], LHS, getOpcodeName(BinOp->getOpcode()), RHS);
-        } else { //Otherwise, assigns a fresh number and stores it
+        } else {
           ValueNumbers[&I] = nextValueNumber++;
           LVNTable[Expr] = ValueNumbers[&I];
-          //errs() << I << "\t" << ValueNumbers[&I] << " = "
-                 //<< LHS << " " << getOpcodeName(BinOp->getOpcode()) << " " << RHS << "\n";
           errs() << formatv("{0,-40} {1} = {2} {3} {4}\n", I, ValueNumbers[&I], LHS, getOpcodeName(BinOp->getOpcode()), RHS);
         }
       }
