@@ -22,6 +22,8 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FormatVariadic.h"
 #include <map>
+#include <deque>
+#include <set>
 
 using namespace llvm;
 
@@ -32,96 +34,116 @@ using namespace llvm;
 // everything in an anonymous namespace.
 namespace {
 
-struct Expression {
-  unsigned Opcode;
-  unsigned LHS, RHS;
-
-  Expression(unsigned Op, unsigned L, unsigned R) : Opcode(Op), LHS(L), RHS(R) {
-    // Handle commutativity for addition and multiplication
-    if (Op == Instruction::Add || Op == Instruction::Mul) {
-      if (L > R) std::swap(LHS, RHS);
-    }
-  }
-
-  bool operator<(const Expression &Other) const {
-    return std::tie(Opcode, LHS, RHS) < std::tie(Other.Opcode, Other.LHS, Other.RHS);
-  }
-};
-
-std::string getOpcodeName(unsigned Opcode) {
-  switch (Opcode) {
-  case Instruction::Add: return "add";
-  case Instruction::Sub: return "sub";
-  case Instruction::Mul: return "mul";
-  case Instruction::UDiv:
-  case Instruction::SDiv: return "div";
-  default: return "unknown";
-  }
-}
-
 
 // This method implements what the pass does
 void visitor(Function &F) {
-  errs() << "ValueNumbering: " << F.getName() << "\n";
+        std::map<BasicBlock *, std::set<Value *>> UEVarMap;
+        std::map<BasicBlock *, std::set<Value *>> VarKillMap;
+        std::map<BasicBlock *, std::set<Value *>> LiveOutMap;
+        std::map<Value *, Value *> MemToVar;  // Maps memory locations (allocas) to variables
 
-  std::map<Expression, unsigned> LVNTable;
-  std::map<Value *, unsigned> ValueNumbers;
-  std::map<int, unsigned> ConstantNumbers;
-  unsigned nextValueNumber = 1;
-
-  for (auto &BB : F) {
-    for (auto &I : BB) {
-      if (auto *Store = dyn_cast<StoreInst>(&I)) {
-        Value *StoredValue = Store->getValueOperand();
-        Value *Pointer = Store->getPointerOperand();
-
-        if (auto *ConstOp = dyn_cast<ConstantInt>(StoredValue)) {
-          int ConstValue = ConstOp->getSExtValue();
-          if (!ConstantNumbers.count(ConstValue)) {
-            ConstantNumbers[ConstValue] = nextValueNumber++;
-          }
-          ValueNumbers[Pointer] = ConstantNumbers[ConstValue];
-        } else {
-          if (!ValueNumbers.count(StoredValue)) {
-            ValueNumbers[StoredValue] = nextValueNumber++;
-          }
-          ValueNumbers[Pointer] = ValueNumbers[StoredValue];
+        // Step 1: Identify allocated variables (`alloca`)
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+                    if (AI->hasName()) {
+                        MemToVar[AI] = AI;  // Map alloca to itself as the variable
+                    }
+                }
+            }
         }
-        errs() << formatv("{0,-40} {1} = {2}\n", I, ValueNumbers[Pointer], ValueNumbers[StoredValue]);
-      } else if (auto *Load = dyn_cast<LoadInst>(&I)) {
-        Value *Pointer = Load->getPointerOperand();
 
-        if (ValueNumbers.count(Pointer)) {
-          ValueNumbers[&I] = ValueNumbers[Pointer];
-        } else {
-          ValueNumbers[&I] = nextValueNumber++;
-        }
-        errs() << formatv("{0,-40} {1} = {2}\n", I, ValueNumbers[&I], ValueNumbers[Pointer]);
-      } else if (auto *BinOp = dyn_cast<BinaryOperator>(&I)) {
-        unsigned LHS = ValueNumbers[BinOp->getOperand(0)];
-        unsigned RHS;
-        if (auto *ConstOp = dyn_cast<ConstantInt>(BinOp->getOperand(1))) {
-          int ConstValue = ConstOp->getSExtValue();
-          if (!ConstantNumbers.count(ConstValue)) {
-            ConstantNumbers[ConstValue] = nextValueNumber++;
-          }
-          RHS = ConstantNumbers[ConstValue];
-        } else {
-          RHS = ValueNumbers[BinOp->getOperand(1)];
-        }
-        Expression Expr(BinOp->getOpcode(), LHS, RHS);
+        // Step 2: Compute UEVar and VarKill for each block
+        for (BasicBlock &BB : F) {
+            std::set<Value *> UEVar;
+            std::set<Value *> VarKill;
+            std::set<Value *> defined;
 
-        if (LVNTable.count(Expr)) {
-          ValueNumbers[&I] = LVNTable[Expr];
-          errs() << formatv("{0,-40} {1} = {2} {3} {4} (redundant)\n", I, ValueNumbers[&I], LHS, getOpcodeName(BinOp->getOpcode()), RHS);
-        } else {
-          ValueNumbers[&I] = nextValueNumber++;
-          LVNTable[Expr] = ValueNumbers[&I];
-          errs() << formatv("{0,-40} {1} = {2} {3} {4}\n", I, ValueNumbers[&I], LHS, getOpcodeName(BinOp->getOpcode()), RHS);
+            for (Instruction &I : BB) {
+                // Handle StoreInst: defines a variable
+                if (auto *SI = dyn_cast<StoreInst>(&I)) {
+                    Value *storedVarPtr = SI->getPointerOperand();
+                    if (MemToVar.find(storedVarPtr) != MemToVar.end()) {
+                        Value *var = MemToVar[storedVarPtr];
+                        VarKill.insert(var);
+                        defined.insert(var);
+                    }
+                    continue;
+                }
+
+                // Handle LoadInst: uses a variable
+                if (auto *LI = dyn_cast<LoadInst>(&I)) {
+                    Value *loadedVarPtr = LI->getPointerOperand();
+                    if (MemToVar.find(loadedVarPtr) != MemToVar.end()) {
+                        Value *var = MemToVar[loadedVarPtr];
+                        if (defined.find(var) == defined.end()) {
+                            UEVar.insert(var);
+                        }
+                    }
+                    continue;
+                }
+
+                // Other instructions (add, icmp, etc.) are ignored as they handle SSA temporaries
+            }
+
+            UEVarMap[&BB] = UEVar;
+            VarKillMap[&BB] = VarKill;
         }
-      }
-    }
-  }
+
+        // Step 3: Compute LiveOut using worklist-based approach
+        std::deque<BasicBlock *> worklist;
+        for (BasicBlock &BB : F) {
+            worklist.push_back(&BB);
+        }
+
+        while (!worklist.empty()) {
+            BasicBlock *BB = worklist.front();
+            worklist.pop_front();
+
+            std::set<Value *> newLiveOut;
+
+            for (BasicBlock *Succ : successors(BB)) {
+                // Add UEVar of successor
+                for (Value *V : UEVarMap[Succ]) {
+                    newLiveOut.insert(V);
+                }
+                // Add (LiveOut of successor - VarKill of successor)
+                for (Value *V : LiveOutMap[Succ]) {
+                    if (VarKillMap[Succ].find(V) == VarKillMap[Succ].end()) {
+                        newLiveOut.insert(V);
+                    }
+                }
+            }
+
+            if (newLiveOut != LiveOutMap[BB]) {
+                LiveOutMap[BB] = newLiveOut;
+                for (BasicBlock *Pred : predecessors(BB)) {
+                    worklist.push_back(Pred);
+                }
+            }
+        }
+
+        // Step 4: Print the results
+        for (BasicBlock &BB : F) {
+            errs() << "----- " << BB.getName() << " -----\n";
+
+            auto printVarSet = [](const std::string &label, const std::set<Value *> &varSet) {
+                errs() << label << ": ";
+                bool first = true;
+                for (Value *V : varSet) {
+                    if (V->hasName()) {
+                        if (!first) errs() << " ";
+                        errs() << V->getName();
+                        first = false;
+                    }
+                }
+                errs() << "\n";
+            };
+
+            printVarSet("UEVAR", UEVarMap[&BB]);
+            printVarSet("VARKILL", VarKillMap[&BB]);
+            printVarSet("LIVEOUT", LiveOutMap[&BB]);
+        }
 }
 
 // New PM implementation
